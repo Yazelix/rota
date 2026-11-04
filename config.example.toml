@@ -46,6 +46,9 @@ parser = "claude_text"
 [backends.cap]
 max = 1
 executable = "claude"
+# If a wrapper changes argv[0], list the actual native binary paths:
+# runtime_executables = ["/PATH/TO/.claude-wrapped"]
+# For an interpreted CLI, use executable = "node" and script = "/PATH/TO/cli.js"
 [backends.cap.env]
 CLAUDE_CONFIG_DIR = "/PATH/TO/secondary"
 [backends.limits.implement]

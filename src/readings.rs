@@ -53,6 +53,7 @@ pub fn probe(
         unsafe {
             libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
+        let _ = child.kill();
         let _ = child.wait();
     };
     let mut bytes = None;
@@ -109,12 +110,21 @@ fn executable_matches(
             .file_name()
             .is_some_and(|n| n == cap.executable.as_str())
     }) || actual.is_some_and(|p| {
-        p.file_name().is_some_and(|n| n == cap.executable.as_str()) || resolved == Some(p)
+        p.file_name().is_some_and(|n| n == cap.executable.as_str())
+            || resolved == Some(p)
+            || cap
+                .runtime_executables
+                .iter()
+                .any(|runtime| fs::canonicalize(runtime).ok().as_deref() == Some(p))
     })
 }
 
 fn matches_filters(cap: &Cap, argv: &[String], env: &BTreeMap<String, String>) -> bool {
-    !argv.iter().any(|arg| cap.exclude_args.contains(arg))
+    cap.script.as_ref().is_none_or(|script| {
+        argv.iter()
+            .skip(1)
+            .any(|arg| canonical_equal(arg, &script.to_string_lossy()))
+    }) && !argv.iter().any(|arg| cap.exclude_args.contains(arg))
         && cap
             .env
             .iter()
@@ -191,9 +201,6 @@ pub fn read(backend: &Backend, cwd: &Path, allow_refresh: bool) -> Reading {
         probe(backend, &backend.guard, 15, cwd).map_err(|_| "command guard missing or failed")?;
         if let Some(check) = &backend.account_check {
             probe(backend, check, 20, cwd).map_err(|_| "account check failed")?;
-        }
-        if let Some(cap) = &backend.cap {
-            reading.running = running(cap)?;
         }
         if let Some(reader) = &backend.quota {
             let get = || {
@@ -279,6 +286,8 @@ mod tests {
         let mut cap = Cap {
             max: 1,
             executable: "fake-agent".into(),
+            runtime_executables: vec![],
+            script: None,
             env: BTreeMap::new(),
             exclude_args: vec!["/usage".into()],
         };

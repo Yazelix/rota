@@ -58,7 +58,8 @@ expanded. Keep personal state and logs outside the repository.
   `max_used` exclusively. `strictly_above_min` makes the minimum exclusive;
   `allow_missing` permits absent windows in an otherwise valid reading. `"*"`
   checks every returned window. Eon window keys are `DURATIONm/INDEX` to preserve
-  scoped windows with the same duration.
+  scoped windows with the same duration. Eon snapshots must report `state = "fresh"`;
+  missing, stale, error and unknown snapshots refuse.
 - A backend without a quota reader requires explicit `allow_unknown_quota = true`.
   An unsuccessful configured reader always refuses. The example disables OpenCode
   until a model and guard are chosen.
@@ -68,6 +69,9 @@ expanded. Keep personal state and logs outside the repository.
   `state_file` serializes rota launches through exec; independently started CLIs
   are observed by the process scan rather than controlled by this lock. Caps are
   rechecked before refresh and exec, including resolved executable identities.
+  Set `runtime_executables` to the actual binary paths behind wrappers that change
+  argv[0]. For an interpreted CLI, set the executable to its interpreter basename
+  and `script` to the absolute CLI script path to distinguish other interpreter jobs.
 - `state_file` is written atomically. `log_file` receives JSON lines with time,
   folder, role, level, decision and readings, without prompt contents. Fallback and
   refusal are explicit log decisions. `trusted_settings` atomically appends the

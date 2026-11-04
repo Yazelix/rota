@@ -100,6 +100,8 @@ fn process_cap_follows_account_directory_and_executable_symlinks() {
     let cap = Cap {
         max: 1,
         executable: "sleep".into(),
+        runtime_executables: vec![],
+        script: None,
         env: BTreeMap::from([("ROTA_TEST_ACCOUNT".into(), account.to_str().unwrap().into())]),
         exclude_args: vec![],
     };
@@ -142,6 +144,8 @@ fn refresh_rechecks_cap_after_a_slow_failed_probe() {
     backend.cap = Some(rota::config::Cap {
         max: 1,
         executable: "sleep".into(),
+        runtime_executables: vec![],
+        script: None,
         env: [("ROTA_TEST_REFRESH".into(), dir.to_str().unwrap().into())].into(),
         exclude_args: vec![],
     });
@@ -173,4 +177,102 @@ fn refresh_rechecks_cap_after_a_slow_failed_probe() {
     assert_eq!(reading.running, 1);
     assert!(reading.problem.unwrap().contains("busy"));
     assert!(!refreshed.exists());
+}
+
+#[test]
+fn invalid_filename_bytes_are_an_input_error() {
+    use std::os::unix::ffi::OsStringExt;
+    let output = Command::new(env!("CARGO_BIN_EXE_rota"))
+        .args(["launch", "--dry-run"])
+        .arg(std::ffi::OsString::from_vec(b"missing-\xff".to_vec()))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("arguments must be UTF-8")
+    );
+}
+
+#[test]
+fn wrapped_alias_uses_configured_runtime_identity() {
+    use rota::{config::Cap, readings::running};
+    use std::{
+        collections::BTreeMap,
+        os::unix::fs::{PermissionsExt, symlink},
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = tempfile::tempdir_in("target").unwrap();
+    let dir = fs::canonicalize(dir.path()).unwrap();
+    let native = dir.join(".worker-wrapped");
+    fs::copy("/bin/sleep", &native).unwrap();
+    let wrapper = dir.join("worker");
+    fs::write(
+        &wrapper,
+        b"#!/bin/bash\nexec -a \"$0\" \"${0%/*}/.worker-wrapped\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = dir.join("different-alias");
+    symlink(&wrapper, &alias).unwrap();
+    let cap = Cap {
+        max: 1,
+        executable: "worker".into(),
+        runtime_executables: vec![native],
+        script: None,
+        env: BTreeMap::from([("ROTA_TEST_WRAPPED".into(), dir.to_str().unwrap().into())]),
+        exclude_args: vec![],
+    };
+    let mut child = Command::new(alias)
+        .arg("30")
+        .env("ROTA_TEST_WRAPPED", &dir)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut count = running(&cap);
+    while matches!(count, Ok(0)) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+        count = running(&cap);
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(count.unwrap(), 1);
+}
+
+#[test]
+fn interpreted_cli_cap_distinguishes_other_scripts() {
+    use rota::{config::Cap, readings::running};
+    use std::{collections::BTreeMap, process::Stdio};
+    let dir = tempfile::tempdir_in("target").unwrap();
+    let dir = fs::canonicalize(dir.path()).unwrap();
+    let script = dir.join("cli.sh");
+    let other = dir.join("other.sh");
+    fs::write(&script, "read ignored\n").unwrap();
+    fs::write(&other, "read ignored\n").unwrap();
+    let cap = Cap {
+        max: 1,
+        executable: "sh".into(),
+        runtime_executables: vec![],
+        script: Some(script.clone()),
+        env: BTreeMap::from([("ROTA_TEST_SCRIPT".into(), dir.to_str().unwrap().into())]),
+        exclude_args: vec![],
+    };
+    let spawn = |path| {
+        Command::new("sh")
+            .arg(path)
+            .env("ROTA_TEST_SCRIPT", &dir)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut cli = spawn(script);
+    let mut unrelated = spawn(other);
+    let count = running(&cap);
+    cli.kill().unwrap();
+    cli.wait().unwrap();
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    assert_eq!(count.unwrap(), 1);
 }

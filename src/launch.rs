@@ -287,8 +287,6 @@ pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
     for prepare in &backend.prepare {
         readings::probe(backend, prepare, 30, &cwd).map_err(io_failure)?;
     }
-    atomic_write(&config.state_file, format!("{}\n", backend.name).as_bytes())
-        .map_err(io_failure)?;
     let argv: Vec<_> = backend.commands[&options.level]
         .iter()
         .map(|a| match a.as_str() {
@@ -301,6 +299,8 @@ pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
         log(config, options, &cwd, &readings, None)?;
         return Err((3, problem));
     }
+    atomic_write(&config.state_file, format!("{}\n", backend.name).as_bytes())
+        .map_err(io_failure)?;
     let error = readings::command(backend, &argv).current_dir(&cwd).exec();
     Err(io_failure(format!(
         "could not exec {}: {error}",

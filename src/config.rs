@@ -96,6 +96,9 @@ pub struct Cap {
     pub max: usize,
     pub executable: String,
     #[serde(default)]
+    pub runtime_executables: Vec<PathBuf>,
+    pub script: Option<PathBuf>,
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub exclude_args: Vec<String>,
@@ -170,9 +173,17 @@ impl Config {
                 return fail("invalid check, preparation or reader command/timeout");
             }
             if b.cap.as_ref().is_some_and(|c| {
-                c.max == 0 || c.executable.is_empty() || c.executable.contains('/')
+                c.max == 0
+                    || c.executable.is_empty()
+                    || c.executable.contains('/')
+                    || c.runtime_executables
+                        .iter()
+                        .chain(c.script.iter())
+                        .any(|p| !p.is_absolute())
             }) {
-                return fail("cap needs positive max and an executable basename");
+                return fail(
+                    "cap needs positive max, an executable basename and absolute runtime/script paths",
+                );
             }
             if b.env
                 .keys()
@@ -229,6 +240,7 @@ mod tests {
                 "guard = []",
             ),
             ("max = 1", "max = 0"),
+            ("max = 1", "max = 1\nruntime_executables = ['relative']"),
             ("five_hour = 30", "five_hour = 101"),
             ("fallback = \"main\"", "fallback = \"absent\""),
             ("roles = []", "roles = [\"implement\"]"),

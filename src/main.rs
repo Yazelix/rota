@@ -20,7 +20,13 @@ fn load_config() -> Result<Config, String> {
 }
 
 fn run() -> Result<(), (u8, String)> {
-    let args: Vec<_> = env::args().skip(1).collect();
+    let args: Vec<_> = env::args_os()
+        .skip(1)
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| (2, "arguments must be UTF-8".into()))
+        })
+        .collect::<Result<_, _>>()?;
     if args == ["--help"] || args == ["-h"] {
         println!("{USAGE}");
         return Ok(());

@@ -1,1 +1,1 @@
-{"codex_quota":{"state":"fresh","windows":[{"duration_minutes":240,"remaining_percent":67},{"duration_minutes":9000,"remaining_percent":42}]},"claude_quota":{"windows":[{"duration_minutes":240,"remaining_percent":76.5}]}}
+{"codex_quota":{"state":"fresh","windows":[{"duration_minutes":240,"remaining_percent":67},{"duration_minutes":9000,"remaining_percent":42}]},"claude_quota":{"windows":[{"duration_minutes":240,"remaining_percent":76.5}],"state":"fresh"}}

@@ -82,9 +82,12 @@ pub fn parse(parser: Parser, text: &str) -> Result<Windows, String> {
             } else {
                 "claude_quota"
             };
-            let items = json
-                .get(key)
-                .and_then(|v| v.get("windows"))
+            let snapshot = json.get(key).ok_or("quota snapshot unavailable")?;
+            if snapshot.get("state").and_then(|s| s.as_str()) != Some("fresh") {
+                return Err("quota snapshot is not fresh".into());
+            }
+            let items = snapshot
+                .get("windows")
                 .and_then(|v| v.as_array())
                 .filter(|a| !a.is_empty())
                 .ok_or("quota windows unavailable")?;
@@ -170,5 +173,19 @@ mod tests {
             assert!(parse(parser, text).is_err(), "{text}");
         }
         assert!(parse(Parser::ClaudeText, "None None").unwrap().is_empty());
+    }
+    #[test]
+    fn eon_rejects_unusable_snapshots_even_with_remaining_quota() {
+        for parser in [Parser::EonCodex, Parser::EonClaude] {
+            for state in [Some("stale"), Some("error"), Some("unknown"), None] {
+                let mut snapshot = serde_json::json!({"windows":[{"duration_minutes":240,"remaining_percent":80}]});
+                if let Some(state) = state {
+                    snapshot["state"] = state.into();
+                }
+                let text = serde_json::json!({"codex_quota":snapshot, "claude_quota":snapshot})
+                    .to_string();
+                assert!(parse(parser, &text).is_err());
+            }
+        }
     }
 }
