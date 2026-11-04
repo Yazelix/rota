@@ -1,0 +1,105 @@
+# Replace all /PATH/TO values; percentages below are invented examples.
+# Commands are argv arrays, never shell strings. Only whole arguments {prompt}
+# and {cwd} are substituted. Backend order is rotation order.
+state_file = "/PATH/TO/state/last-pick"
+log_file = "/PATH/TO/state/decisions.jsonl"
+fallback = "main"
+
+[[backends]]
+name = "alpha"
+roles = ["implement", "review"]
+guard = ["test", "-f", "/PATH/TO/guard"]
+trusted_settings = "/PATH/TO/agy/settings.json"
+[backends.commands]
+medium = ["agy", "-i", "{prompt}", "--model", "MODEL-MEDIUM", "--dangerously-skip-permissions"]
+high = ["agy", "-i", "{prompt}", "--model", "MODEL-HIGH", "--dangerously-skip-permissions"]
+[backends.quota]
+command = ["agy", "-p", "/usage"]
+parser = "agy"
+timeout_seconds = 60
+[backends.cap]
+max = 1
+executable = "agy"
+exclude_args = ["/usage"]
+[backends.limits.implement.min_remaining]
+five_hour = 30
+weekly = 15
+[backends.limits.review.min_remaining]
+five_hour = 15
+weekly = 15
+
+[[backends]]
+name = "secondary"
+roles = ["implement", "review"]
+guard = ["test", "-f", "/PATH/TO/guard"]
+required_files = ["/PATH/TO/secondary/.credentials.json"]
+[backends.env]
+CLAUDE_CONFIG_DIR = "/PATH/TO/secondary"
+[backends.commands]
+medium = ["claude", "{prompt}"]
+high = ["claude", "{prompt}"]
+[backends.quota]
+command = ["python3", "-I", "/PATH/TO/usage.py", "/PATH/TO/secondary"]
+parser = "claude_text"
+# Optional refresh runs only during a real launch, and only below the cap.
+# refresh = ["claude", "-p", "Reply with ok."]
+[backends.cap]
+max = 1
+executable = "claude"
+[backends.cap.env]
+CLAUDE_CONFIG_DIR = "/PATH/TO/secondary"
+[backends.limits.implement]
+allow_missing = true
+[backends.limits.implement.max_used]
+five_hour = 60
+seven_day = 75
+[backends.limits.review]
+allow_missing = true
+[backends.limits.review.max_used]
+five_hour = 85
+seven_day = 90
+
+[[backends]]
+name = "code"
+roles = ["implement"]
+guard = ["test", "-f", "/PATH/TO/guard"]
+account_check = ["/PATH/TO/account-check"]
+excluded_roots = ["/PATH/TO/other-account-projects"]
+[backends.env]
+CODEX_HOME = "/PATH/TO/codex"
+[backends.commands]
+medium = ["codex", "-m", "MODEL", "-c", "model_reasoning_effort=high", "--dangerously-bypass-approvals-and-sandbox", "-C", "{cwd}", "{prompt}"]
+high = ["codex", "-m", "MODEL", "-c", "model_reasoning_effort=xhigh", "--dangerously-bypass-approvals-and-sandbox", "-C", "{cwd}", "{prompt}"]
+[backends.quota]
+command = ["eon", "workspace", "--json"]
+parser = "eon_codex"
+[backends.limits.implement]
+strictly_above_min = true
+[backends.limits.implement.min_remaining]
+"*" = 0
+
+[[backends]]
+name = "open"
+enabled = false
+roles = ["implement", "review"]
+allow_unknown_quota = true
+guard = ["test", "-f", "/PATH/TO/guard"]
+# Proxy-backed commands can also set a base URL here.
+[backends.env]
+PROVIDER_BASE_URL = "http://PROXY-HOST:PORT"
+[backends.commands]
+medium = ["opencode", "mini", "-m", "PROVIDER/MODEL#MEDIUM", "--prompt", "{prompt}"]
+high = ["opencode", "mini", "-m", "PROVIDER/MODEL#HIGH", "--prompt", "{prompt}"]
+[backends.cap]
+max = 1
+executable = "opencode"
+
+[[backends]]
+name = "main"
+roles = []
+unset_env = ["CLAUDE_CONFIG_DIR"]
+guard = ["test", "-f", "/PATH/TO/guard"]
+allow_unknown_quota = true
+[backends.commands]
+medium = ["claude", "{prompt}"]
+high = ["claude", "{prompt}"]
