@@ -1,0 +1,14 @@
+[package]
+name = "rota"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Picks which coding-agent subscription runs your next agent session"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Yazelix/rota"
+homepage = "https://github.com/Yazelix/rota"
+readme = "README.md"
+exclude = [".beads/"]
+publish = false
+
+[dependencies]
