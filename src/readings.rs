@@ -150,7 +150,7 @@ pub fn read(backend: &Backend, cwd: &Path, allow_refresh: bool) -> Reading {
                 && backend.cap.as_ref().is_none_or(|c| reading.running < c.max)
             {
                 if let Some(refresh) = &reader.refresh {
-                    let _ = probe(backend, refresh, reader.timeout_seconds, cwd);
+                    let _ = probe(backend, refresh, reader.refresh_timeout_seconds, cwd);
                     quota = get();
                 }
             }

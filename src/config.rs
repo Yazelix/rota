@@ -62,6 +62,8 @@ pub struct Reader {
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
     pub refresh: Option<Vec<String>>,
+    #[serde(default = "refresh_timeout")]
+    pub refresh_timeout_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -101,6 +103,9 @@ pub struct Cap {
 
 fn yes() -> bool {
     true
+}
+fn refresh_timeout() -> u64 {
+    90
 }
 fn timeout() -> u64 {
     30
@@ -158,6 +163,7 @@ impl Config {
                 || b.quota.as_ref().is_some_and(|q| {
                     !command_valid(&q.command)
                         || q.timeout_seconds == 0
+                        || q.refresh_timeout_seconds == 0
                         || q.refresh.as_ref().is_some_and(|c| !command_valid(c))
                 })
             {

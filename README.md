@@ -7,22 +7,73 @@ Antigravity, OpenCode and others. rota looks at each one's remaining quota and
 how many sessions it already runs, then starts the next agent session on a
 backend that has room, with the model and effort level the task asks for.
 
-## Status
+## Usage
 
-Planning. rota is not usable yet: the binary only prints its usage. The first
-version is planned in Beads (`br ready`).
-
-## Planned commands
+Build with `cargo build --release` (Linux, Rust 1.85 or later, GNU `timeout`
+on PATH). Copy `config.example.toml` to `~/.config/rota/config.toml` and replace
+its placeholder paths, commands, models and example percentages.
 
 ```text
-rota launch [--role implement|review] [--level medium|high] [--only BACKEND] <prompt-file>
+rota launch [--role implement|review] [--level medium|high] [--only BACKEND] [--dry-run] <prompt-file>
 rota status [--json]
 ```
 
-- `launch` checks each allowed backend, picks one, and starts the agent CLI
-  with the prompt from the file.
-- `status` shows each backend's quota readings, running sessions and whether
-  it is available. `--json` prints the same as data.
+Launch defaults to `implement` and `high`, runs from the current folder and
+replaces itself with the selected CLI. It checks backend guards, account checks,
+quota limits and running processes before rotating to the next available backend.
+Only implementers without `--only` can use the configured fallback, reported as
+`FALLBACK`. Exit codes: 2 for invalid input/config, 3 for refusal, 1 for I/O or
+launch failure. Status reports availability for both roles.
+
+`--dry-run` prints the pick and shell command, showing the prompt as `$(cat file)`.
+It does not write the state, log, lock or trusted settings, run preparation hooks,
+or refresh an account. Quota and guard commands must themselves be read-only.
+Status also skips refresh and writes no rota files.
+
+## Configuration
+
+`ROTA_CONFIG` selects a config file; otherwise rota uses
+`$XDG_CONFIG_HOME/rota/config.toml`, defaulting to `~/.config/rota/config.toml`.
+Paths in TOML are literal: use absolute paths; shell variables and `~` are not
+expanded. Keep personal state and logs outside the repository.
+
+- `backends` array order is round-robin order. `roles` controls eligibility;
+  the fallback backend has an empty role list. Disabled backends never run checks.
+- `commands.medium` and `commands.high` are argv arrays, with one whole argument
+  `{prompt}` and optional `{cwd}` arguments. They run directly, without a shell.
+  OpenCode uses `opencode mini -m MODEL#VARIANT --prompt {prompt}`.
+- `env` adds environment variables to commands and probes, including proxy base
+  URLs. `unset_env` removes inherited variables, for example on the main fallback.
+- `guard` must exit successfully. Configure it to verify the command guard is
+  installed **and hooked into that backend**. `required_files`, `account_check`
+  and `excluded_roots` support credential/account checks.
+- `quota.command` returns data for `quota.parser`: `agy` (tab-separated usage),
+  `claude_text` (five-hour/seven-day used percentages, with `None` for missing),
+  `claude_json` (usage endpoint JSON), `eon_codex` / `eon_claude` (workspace JSON),
+  or `remaining_json` (object mapping window names to remaining percentages).
+  Reader commands have a configurable timeout. Optional `refresh` runs only
+  after a failed real-launch probe, below the backend's cap, then retries once.
+- `limits.implement` / `limits.review` compare `min_remaining` inclusively and
+  `max_used` exclusively. `strictly_above_min` makes the minimum exclusive;
+  `allow_missing` permits absent windows in an otherwise valid reading. `"*"`
+  checks every returned window. Eon window keys are `DURATIONm/INDEX` to preserve
+  scoped windows with the same duration.
+- A backend without a quota reader requires explicit `allow_unknown_quota = true`.
+  An unsuccessful configured reader always refuses. The example disables OpenCode
+  until a model and guard are chosen.
+- `cap` scans Linux `/proc` for an executable basename and optional environment
+  values; account-directory aliases are canonicalized. `exclude_args` omits usage
+  probes. Counts include every matching process, regardless of role. A lock beside
+  `state_file` serializes rota launches through exec; independently started CLIs
+  are observed by the process scan rather than controlled by this lock.
+- `state_file` is written atomically. `log_file` receives JSON lines with time,
+  folder, role, level, decision and readings, without prompt contents. Fallback and
+  refusal are explicit log decisions. `trusted_settings` atomically appends the
+  folder to `trustedWorkspaces`, preserving other JSON keys and the file mode.
+  `prepare` is an optional list of checked commands run just before exec.
+
+Configuration and reader fixtures are tested with `cargo test`. Before committing,
+run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.
 
 ## Design principles
 

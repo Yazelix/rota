@@ -1,5 +1,5 @@
 use rota::config::{Config, Role};
-use rota::{decision, readings};
+use rota::{decision, launch, readings};
 use std::{env, fs, process::ExitCode};
 
 const USAGE: &str = "Usage: rota launch [--role implement|review] [--level medium|high] [--only BACKEND] [--dry-run] <prompt-file>\n       rota status [--json]\nConfig: $ROTA_CONFIG or $XDG_CONFIG_HOME/rota/config.toml (default ~/.config/rota/config.toml)";
@@ -24,6 +24,11 @@ fn run() -> Result<(), (u8, String)> {
     if args == ["--help"] || args == ["-h"] {
         println!("{USAGE}");
         return Ok(());
+    }
+    if args.first().is_some_and(|s| s == "launch") {
+        let options = launch::parse(&args[1..])?;
+        let config = load_config().map_err(|e| (2, e))?;
+        return launch::run(&config, &options);
     }
     if args != ["status"] && args != ["status", "--json"] {
         return Err((2, USAGE.into()));
