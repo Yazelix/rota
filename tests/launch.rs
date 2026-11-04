@@ -109,7 +109,8 @@ fn process_cap_follows_account_directory_and_executable_symlinks() {
     symlink("/bin/sleep", &executable_alias).unwrap();
     let mut child = Command::new(executable_alias)
         .arg("30")
-        .env("ROTA_TEST_ACCOUNT", alias)
+        .current_dir(&dir)
+        .env("ROTA_TEST_ACCOUNT", "alias")
         .spawn()
         .unwrap();
     let count = running(&cap);
@@ -259,16 +260,17 @@ fn interpreted_cli_cap_distinguishes_other_scripts() {
         env: BTreeMap::from([("ROTA_TEST_SCRIPT".into(), dir.to_str().unwrap().into())]),
         exclude_args: vec![],
     };
-    let spawn = |path| {
+    let spawn = |path: &str| {
         Command::new("sh")
+            .current_dir(&dir)
             .arg(path)
             .env("ROTA_TEST_SCRIPT", &dir)
             .stdin(Stdio::piped())
             .spawn()
             .unwrap()
     };
-    let mut cli = spawn(script);
-    let mut unrelated = spawn(other);
+    let mut cli = spawn("cli.sh");
+    let mut unrelated = spawn("other.sh");
     let count = running(&cap);
     cli.kill().unwrap();
     cli.wait().unwrap();

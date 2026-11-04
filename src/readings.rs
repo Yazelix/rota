@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -91,7 +91,8 @@ pub fn probe(
     }
 }
 
-fn canonical_equal(a: &str, b: &str) -> bool {
+fn canonical_equal(a: impl AsRef<Path>, b: impl AsRef<Path>) -> bool {
+    let (a, b) = (a.as_ref(), b.as_ref());
     a == b
         || fs::canonicalize(a)
             .ok()
@@ -119,16 +120,16 @@ fn executable_matches(
     })
 }
 
-fn matches_filters(cap: &Cap, argv: &[String], env: &BTreeMap<String, String>) -> bool {
+fn matches_filters(cap: &Cap, argv: &[String], env: &BTreeMap<String, String>, cwd: &Path) -> bool {
     cap.script.as_ref().is_none_or(|script| {
         argv.iter()
             .skip(1)
-            .any(|arg| canonical_equal(arg, &script.to_string_lossy()))
+            .any(|arg| canonical_equal(cwd.join(arg), script))
     }) && !argv.iter().any(|arg| cap.exclude_args.contains(arg))
-        && cap
-            .env
-            .iter()
-            .all(|(key, value)| env.get(key).is_some_and(|v| canonical_equal(v, value)))
+        && cap.env.iter().all(|(key, value)| {
+            env.get(key)
+                .is_some_and(|v| v == value || canonical_equal(cwd.join(v), value))
+        })
 }
 
 fn split_null(bytes: &[u8]) -> Vec<String> {
@@ -173,7 +174,16 @@ pub fn running(cap: &Cap) -> Result<usize, String> {
                 Err(_) => return Err("cannot inspect matching process environment".into()),
             }
         };
-        if matches_filters(cap, &argv, &env) {
+        let cwd = if cap.script.is_some() || !cap.env.is_empty() {
+            match fs::read_link(entry.path().join("cwd")) {
+                Ok(cwd) => cwd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err("cannot inspect matching process working directory".into()),
+            }
+        } else {
+            PathBuf::new()
+        };
+        if matches_filters(cap, &argv, &env, &cwd) {
             count += 1;
         }
     }
@@ -292,16 +302,27 @@ mod tests {
             exclude_args: vec!["/usage".into()],
         };
         let args = vec!["/bin/fake-agent".into(), "review anything".into()];
-        assert!(matches_filters(&cap, &args, &BTreeMap::new()));
+        assert!(matches_filters(
+            &cap,
+            &args,
+            &BTreeMap::new(),
+            Path::new(".")
+        ));
         assert!(!matches_filters(
             &cap,
             &["fake-agent".into(), "/usage".into()],
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            Path::new(".")
         ));
         cap.env
             .insert("AGENT_HOME".into(), "/fictional/account".into());
-        assert!(!matches_filters(&cap, &args, &BTreeMap::new()));
-        assert!(matches_filters(&cap, &args, &cap.env));
+        assert!(!matches_filters(
+            &cap,
+            &args,
+            &BTreeMap::new(),
+            Path::new(".")
+        ));
+        assert!(matches_filters(&cap, &args, &cap.env, Path::new(".")));
     }
     #[test]
     fn canonical_account_directory_aliases_match() {
