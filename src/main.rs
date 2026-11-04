@@ -37,31 +37,38 @@ fn run() -> Result<(), (u8, String)> {
     let cwd = env::current_dir().map_err(|e| (1, e.to_string()))?;
     let indices: Vec<_> = (0..config.backends.len()).collect();
     let readings = readings::collect(&config, &indices, &cwd, false);
-    let status: Vec<_> = config.backends.iter().zip(&readings).map(|(b,r)| {
-        serde_json::json!({ "backend": b.name, "enabled": b.enabled, "reading": r,
-            "implement": status_for(b, r, Role::Implement), "review": status_for(b, r, Role::Review) })
-    }).collect();
     if args.len() == 2 {
+        let status: Vec<_> = config.backends.iter().zip(&readings).map(|(b,r)| {
+            serde_json::json!({ "backend": b.name, "enabled": b.enabled, "reading": r,
+                "implement": status_for(&config, b, r, Role::Implement), "review": status_for(&config, b, r, Role::Review) })
+        }).collect();
         println!("{}", serde_json::to_string_pretty(&status).unwrap());
     } else {
-        for item in status {
+        for (b, r) in config.backends.iter().zip(&readings) {
             println!(
-                "{}: implement={} review={} running={} {}{}",
-                item["backend"].as_str().unwrap(),
-                item["implement"],
-                item["review"],
-                item["reading"]["running"],
-                item["reading"]["detail"].as_str().unwrap_or(""),
-                item["reading"]["problem"]
-                    .as_str()
-                    .map(|s| format!(" ({s})"))
-                    .unwrap_or_default()
+                "{}: implement={} review={} running={} {}",
+                b.name,
+                status_for(&config, b, r, Role::Implement),
+                status_for(&config, b, r, Role::Review),
+                r.running,
+                r.detail
             );
         }
     }
     Ok(())
 }
-fn status_for(b: &rota::config::Backend, r: &decision::Reading, role: Role) -> String {
+fn status_for(
+    config: &Config,
+    b: &rota::config::Backend,
+    r: &decision::Reading,
+    role: Role,
+) -> String {
+    if role == Role::Implement && config.fallback.as_deref() == Some(&b.name) {
+        return match decision::availability(b, r, role) {
+            Ok(()) => "fallback available".into(),
+            Err(problem) => format!("fallback unavailable: {problem}"),
+        };
+    }
     if !b.roles.contains(&role) {
         return "not allowed for role".into();
     }

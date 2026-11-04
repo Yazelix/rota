@@ -9,9 +9,9 @@ backend that has room, with the model and effort level the task asks for.
 
 ## Usage
 
-Build with `cargo build --release` (Linux, Rust 1.85 or later, GNU `timeout`
-on PATH). Copy `config.example.toml` to `~/.config/rota/config.toml` and replace
-its placeholder paths, commands, models and example percentages.
+Build with `cargo build --release` (Linux, Rust 1.85 or later). Copy
+`config.example.toml` to `~/.config/rota/config.toml` and replace its placeholder
+paths, commands, models and example percentages.
 
 ```text
 rota launch [--role implement|review] [--level medium|high] [--only BACKEND] [--dry-run] <prompt-file>
@@ -51,8 +51,9 @@ expanded. Keep personal state and logs outside the repository.
   `claude_text` (five-hour/seven-day used percentages, with `None` for missing),
   `claude_json` (usage endpoint JSON), `eon_codex` / `eon_claude` (workspace JSON),
   or `remaining_json` (object mapping window names to remaining percentages).
-  Reader commands have a configurable timeout. Optional `refresh` runs only
-  after a failed real-launch probe, below the backend's cap, then retries once.
+  Reader commands have a configurable timeout covering output collection, and a
+  1 MiB output limit. Optional `refresh` runs only after a failed real-launch probe,
+  below the backend's cap, then retries once.
 - `limits.implement` / `limits.review` compare `min_remaining` inclusively and
   `max_used` exclusively. `strictly_above_min` makes the minimum exclusive;
   `allow_missing` permits absent windows in an otherwise valid reading. `"*"`
@@ -65,7 +66,8 @@ expanded. Keep personal state and logs outside the repository.
   values; account-directory aliases are canonicalized. `exclude_args` omits usage
   probes. Counts include every matching process, regardless of role. A lock beside
   `state_file` serializes rota launches through exec; independently started CLIs
-  are observed by the process scan rather than controlled by this lock.
+  are observed by the process scan rather than controlled by this lock. Caps are
+  rechecked before refresh and exec, including resolved executable identities.
 - `state_file` is written atomically. `log_file` receives JSON lines with time,
   folder, role, level, decision and readings, without prompt contents. Fallback and
   refusal are explicit log decisions. `trusted_settings` atomically appends the

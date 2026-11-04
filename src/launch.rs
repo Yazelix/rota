@@ -242,7 +242,7 @@ pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(io_failure(e)),
     };
-    let readings = readings::collect(config, &indices, &cwd, !options.dry_run);
+    let mut readings = readings::collect(config, &indices, &cwd, !options.dry_run);
     let result = decision::choose(
         config,
         &readings,
@@ -297,6 +297,10 @@ pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
             _ => a.clone(),
         })
         .collect();
+    if let Err(problem) = readings::recheck_cap(backend, &mut readings[pick.index]) {
+        log(config, options, &cwd, &readings, None)?;
+        return Err((3, problem));
+    }
     let error = readings::command(backend, &argv).current_dir(&cwd).exec();
     Err(io_failure(format!(
         "could not exec {}: {error}",

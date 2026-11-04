@@ -31,10 +31,25 @@ pub fn availability(backend: &Backend, reading: &Reading, role: Role) -> Result<
             Err("quota unknown (not explicitly allowed)".into())
         };
     };
+    if remaining.is_empty()
+        && !backend.allow_unknown_quota
+        && !backend.limits.get(&role).is_some_and(|l| l.allow_missing)
+    {
+        return Err("quota empty (not explicitly allowed)".into());
+    }
     if let Some(limits) = backend.limits.get(&role) {
         check_limits(remaining, limits)?;
     }
     Ok(())
+}
+
+fn percent_cmp(value: f64, threshold: f64) -> std::cmp::Ordering {
+    // Complementary percentages can differ at an exact decimal cutoff by a rounding error.
+    if (value - threshold).abs() <= 100.0 * f64::EPSILON {
+        std::cmp::Ordering::Equal
+    } else {
+        value.total_cmp(&threshold)
+    }
 }
 
 fn check_limits(remaining: &BTreeMap<String, f64>, limits: &Limits) -> Result<(), String> {
@@ -50,11 +65,11 @@ fn check_limits(remaining: &BTreeMap<String, f64>, limits: &Limits) -> Result<()
             }
             if values.iter().any(|v| {
                 if used {
-                    100.0 - v >= *threshold
+                    percent_cmp(*v, 100.0 - threshold) != std::cmp::Ordering::Greater
                 } else if limits.strictly_above_min {
-                    *v <= *threshold
+                    percent_cmp(*v, *threshold) != std::cmp::Ordering::Greater
                 } else {
-                    *v < *threshold
+                    percent_cmp(*v, *threshold) == std::cmp::Ordering::Less
                 }
             }) {
                 return Err(format!("quota limit for {window}"));
@@ -275,5 +290,38 @@ mod tests {
         assert!(availability(&config.backends[0], &r[0], Role::Implement).is_err());
         r[4].remaining = None;
         assert!(availability(&config.backends[4], &r[4], Role::Implement).is_ok());
+    }
+    #[test]
+    fn empty_readings_need_explicit_permission_and_decimal_cutoffs_are_exclusive() {
+        let mut config = config();
+        let backend = &mut config.backends[1];
+        backend.limits.clear();
+        let mut reading = Reading {
+            remaining: Some(BTreeMap::new()),
+            ..Reading::default()
+        };
+        assert!(availability(backend, &reading, Role::Implement).is_err());
+        backend.allow_unknown_quota = true;
+        assert!(availability(backend, &reading, Role::Implement).is_ok());
+        backend.allow_unknown_quota = false;
+        for threshold in [30.1, 99.9] {
+            backend.limits.insert(
+                Role::Implement,
+                Limits {
+                    max_used: [("five_hour".into(), threshold)].into(),
+                    ..Limits::default()
+                },
+            );
+            for used in [threshold - 0.001, threshold, threshold + 0.001] {
+                reading.remaining = Some(
+                    crate::quota::parse(crate::config::Parser::ClaudeText, &format!("{used} None"))
+                        .unwrap(),
+                );
+                assert_eq!(
+                    availability(backend, &reading, Role::Implement).is_ok(),
+                    used < threshold
+                );
+            }
+        }
     }
 }

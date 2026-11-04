@@ -88,7 +88,7 @@ high = ['never-start-this', '--model', 'high', '{{prompt}}']
 }
 
 #[test]
-fn process_cap_follows_account_directory_symlinks() {
+fn process_cap_follows_account_directory_and_executable_symlinks() {
     use rota::{config::Cap, readings::running};
     use std::{collections::BTreeMap, os::unix::fs::symlink};
     let dir = tempfile::tempdir_in("target").unwrap();
@@ -103,13 +103,74 @@ fn process_cap_follows_account_directory_symlinks() {
         env: BTreeMap::from([("ROTA_TEST_ACCOUNT".into(), account.to_str().unwrap().into())]),
         exclude_args: vec![],
     };
-    let mut child = Command::new("sleep")
+    let executable_alias = dir.join("worker-alias");
+    symlink("/bin/sleep", &executable_alias).unwrap();
+    let mut child = Command::new(executable_alias)
         .arg("30")
         .env("ROTA_TEST_ACCOUNT", alias)
         .spawn()
         .unwrap();
     let count = running(&cap);
+    let mut config = rota::config::Config::parse(include_str!("../config.example.toml")).unwrap();
+    config.backends[0].cap = Some(cap);
+    let mut reading = rota::decision::Reading::default();
+    let rechecked = rota::readings::recheck_cap(&config.backends[0], &mut reading);
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(count.unwrap(), 1);
+    assert!(rechecked.unwrap_err().contains("busy"));
+    assert_eq!(reading.running, 1);
+}
+
+#[test]
+fn refresh_rechecks_cap_after_a_slow_failed_probe() {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+    let dir = tempfile::tempdir_in("target").unwrap();
+    let dir = fs::canonicalize(dir.path()).unwrap();
+    let started = dir.join("probe-started");
+    let refreshed = dir.join("refreshed");
+    let mut config = rota::config::Config::parse(include_str!("../config.example.toml")).unwrap();
+    let mut backend = config.backends.remove(1);
+    backend.guard = vec!["true".into()];
+    backend.required_files.clear();
+    backend
+        .env
+        .insert("ROTA_TEST_REFRESH".into(), dir.to_str().unwrap().into());
+    backend.cap = Some(rota::config::Cap {
+        max: 1,
+        executable: "sleep".into(),
+        env: [("ROTA_TEST_REFRESH".into(), dir.to_str().unwrap().into())].into(),
+        exclude_args: vec![],
+    });
+    let reader = backend.quota.as_mut().unwrap();
+    reader.command = vec![
+        "sh".into(),
+        "-c".into(),
+        r#"touch "$1"; sleep 0.5; printf failed"#.into(),
+        "probe".into(),
+        started.to_str().unwrap().into(),
+    ];
+    reader.refresh = Some(vec!["touch".into(), refreshed.to_str().unwrap().into()]);
+    let probe =
+        thread::spawn(move || rota::readings::read(&backend, std::path::Path::new("."), true));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !started.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(started.exists());
+    let mut child = Command::new("sleep")
+        .arg("30")
+        .env("ROTA_TEST_REFRESH", &dir)
+        .spawn()
+        .unwrap();
+    let reading = probe.join();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let reading = reading.unwrap();
+    assert_eq!(reading.running, 1);
+    assert!(reading.problem.unwrap().contains("busy"));
+    assert!(!refreshed.exists());
 }

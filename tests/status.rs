@@ -7,6 +7,7 @@ fn status_reports_quota_and_never_refreshes() {
     let marker = dir.path().join("refreshed");
     let text = format!(
         r#"
+fallback = 'fallback'
 state_file = 'unused-state'
 log_file = 'unused-log'
 [[backends]]
@@ -20,6 +21,15 @@ high = ['fake-agent', '{{prompt}}']
 command = ['printf', 'not-json']
 parser = 'remaining_json'
 refresh = ['touch', '{}']
+
+[[backends]]
+name = 'fallback'
+roles = []
+guard = ['true']
+allow_unknown_quota = true
+[backends.commands]
+medium = ['fake-agent', '{{prompt}}']
+high = ['fake-agent', '{{prompt}}']
 "#,
         marker.display()
     );
@@ -41,6 +51,8 @@ refresh = ['touch', '{}']
             .contains("quota unreadable")
     );
     assert!(!marker.exists());
+    assert_eq!(json[1]["implement"], "fallback available");
+    assert_eq!(json[1]["review"], "not allowed for role");
     fs::write(&config, text.replace("not-json", "{\"week\":45}")).unwrap();
     let output = run();
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

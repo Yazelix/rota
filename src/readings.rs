@@ -3,8 +3,13 @@ use crate::decision::Reading;
 use crate::quota;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn command(backend: &Backend, argv: &[String]) -> Command {
     let mut cmd = Command::new(&argv[0]);
@@ -22,24 +27,67 @@ pub fn probe(
     seconds: u64,
     cwd: &Path,
 ) -> Result<String, String> {
-    // GNU timeout bounds the command and its descendants, including blocked pipe writers.
-    let mut cmd = Command::new("timeout");
-    cmd.args(["--kill-after=2s", &format!("{seconds}s")])
-        .args(argv);
-    for key in &backend.unset_env {
-        cmd.env_remove(key);
-    }
-    let output = cmd
-        .envs(&backend.env)
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(seconds))
+        .ok_or("check timeout too large")?;
+    let mut child = command(backend, argv)
+        .process_group(0)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output()
-        .map_err(|_| "could not execute check (requires GNU timeout)")?;
-    if !output.status.success() {
-        return Err(format!("check failed ({})", output.status));
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|_| "could not execute check")?;
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(1_048_577)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    let stop = |child: &mut std::process::Child| {
+        // The unreaped child's PID identifies only the process group we created.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.wait();
+    };
+    let mut bytes = None;
+    loop {
+        if bytes.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(output)) if output.len() <= 1_048_576 => bytes = Some(output),
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                    stop(&mut child);
+                    return Err("check output unreadable or exceeds 1 MiB".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => (),
+            }
+        }
+        // Keep the PID unreaped while a descendant may still hold stdout open.
+        if let Some(output) = &mut bytes {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    return String::from_utf8(std::mem::take(output))
+                        .map_err(|_| "check returned non-UTF-8 output".into());
+                }
+                Ok(Some(status)) => return Err(format!("check failed ({status})")),
+                Ok(None) => (),
+                Err(_) => {
+                    stop(&mut child);
+                    return Err("cannot wait for check".into());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            stop(&mut child);
+            return Err("check timed out".into());
+        }
+        thread::sleep(Duration::from_millis(10));
     }
-    String::from_utf8(output.stdout).map_err(|_| "check returned non-UTF-8 output".into())
 }
 
 fn canonical_equal(a: &str, b: &str) -> bool {
@@ -50,13 +98,23 @@ fn canonical_equal(a: &str, b: &str) -> bool {
             .is_some_and(|(a, b)| a == b)
 }
 
-fn matches_process(cap: &Cap, argv: &[String], env: &BTreeMap<String, String>) -> bool {
-    let executable = argv
-        .first()
-        .and_then(|s| Path::new(s).file_name())
-        .and_then(|s| s.to_str());
-    executable == Some(&cap.executable)
-        && !argv.iter().any(|arg| cap.exclude_args.contains(arg))
+fn executable_matches(
+    cap: &Cap,
+    argv: &[String],
+    actual: Option<&Path>,
+    resolved: Option<&Path>,
+) -> bool {
+    argv.first().is_some_and(|a| {
+        Path::new(a)
+            .file_name()
+            .is_some_and(|n| n == cap.executable.as_str())
+    }) || actual.is_some_and(|p| {
+        p.file_name().is_some_and(|n| n == cap.executable.as_str()) || resolved == Some(p)
+    })
+}
+
+fn matches_filters(cap: &Cap, argv: &[String], env: &BTreeMap<String, String>) -> bool {
+    !argv.iter().any(|arg| cap.exclude_args.contains(arg))
         && cap
             .env
             .iter()
@@ -73,6 +131,8 @@ fn split_null(bytes: &[u8]) -> Vec<String> {
 
 pub fn running(cap: &Cap) -> Result<usize, String> {
     let mut count = 0;
+    let resolved = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .find_map(|dir| fs::canonicalize(dir.join(&cap.executable)).ok());
     for entry in fs::read_dir("/proc").map_err(|_| "cannot scan /proc for concurrency cap")? {
         let entry = entry.map_err(|_| "cannot read process entry")?;
         if !entry
@@ -87,12 +147,8 @@ pub fn running(cap: &Cap) -> Result<usize, String> {
             continue;
         };
         let argv = split_null(&cmdline);
-        if argv
-            .first()
-            .and_then(|s| Path::new(s).file_name())
-            .and_then(|s| s.to_str())
-            != Some(&cap.executable)
-        {
+        let actual = fs::read_link(entry.path().join("exe")).ok();
+        if !executable_matches(cap, &argv, actual.as_deref(), resolved.as_deref()) {
             continue;
         }
         let env = if cap.env.is_empty() {
@@ -107,7 +163,7 @@ pub fn running(cap: &Cap) -> Result<usize, String> {
                 Err(_) => return Err("cannot inspect matching process environment".into()),
             }
         };
-        if matches_process(cap, &argv, &env) {
+        if matches_filters(cap, &argv, &env) {
             count += 1;
         }
     }
@@ -145,11 +201,9 @@ pub fn read(backend: &Backend, cwd: &Path, allow_refresh: bool) -> Reading {
                     .and_then(|s| quota::parse(reader.parser, &s))
             };
             let mut quota = get();
-            if quota.is_err()
-                && allow_refresh
-                && backend.cap.as_ref().is_none_or(|c| reading.running < c.max)
-            {
+            if quota.is_err() && allow_refresh {
                 if let Some(refresh) = &reader.refresh {
+                    recheck_cap(backend, &mut reading)?;
                     let _ = probe(backend, refresh, reader.refresh_timeout_seconds, cwd);
                     quota = get();
                 }
@@ -174,13 +228,23 @@ pub fn read(backend: &Backend, cwd: &Path, allow_refresh: bool) -> Reading {
     reading
 }
 
+pub fn recheck_cap(backend: &Backend, reading: &mut Reading) -> Result<(), String> {
+    if let Some(cap) = &backend.cap {
+        reading.running = running(cap)?;
+        if reading.running >= cap.max {
+            return Err(format!("busy ({} running)", reading.running));
+        }
+    }
+    Ok(())
+}
+
 pub fn collect(
     config: &Config,
     indices: &[usize],
     cwd: &Path,
     allow_refresh: bool,
 ) -> Vec<Reading> {
-    config
+    let mut readings: Vec<_> = config
         .backends
         .iter()
         .enumerate()
@@ -194,7 +258,17 @@ pub fn collect(
                 }
             }
         })
-        .collect()
+        .collect();
+    for index in indices {
+        if config.backends[*index].enabled {
+            if let Err(problem) = recheck_cap(&config.backends[*index], &mut readings[*index]) {
+                if readings[*index].problem.is_none() {
+                    readings[*index].problem = Some(problem);
+                }
+            }
+        }
+    }
+    readings
 }
 
 #[cfg(test)]
@@ -209,16 +283,16 @@ mod tests {
             exclude_args: vec!["/usage".into()],
         };
         let args = vec!["/bin/fake-agent".into(), "review anything".into()];
-        assert!(matches_process(&cap, &args, &BTreeMap::new()));
-        assert!(!matches_process(
+        assert!(matches_filters(&cap, &args, &BTreeMap::new()));
+        assert!(!matches_filters(
             &cap,
             &["fake-agent".into(), "/usage".into()],
             &BTreeMap::new()
         ));
         cap.env
             .insert("AGENT_HOME".into(), "/fictional/account".into());
-        assert!(!matches_process(&cap, &args, &BTreeMap::new()));
-        assert!(matches_process(&cap, &args, &cap.env));
+        assert!(!matches_filters(&cap, &args, &BTreeMap::new()));
+        assert!(matches_filters(&cap, &args, &cap.env));
     }
     #[test]
     fn canonical_account_directory_aliases_match() {
@@ -234,5 +308,18 @@ mod tests {
                 .as_deref(),
             Some("disabled")
         );
+    }
+    #[test]
+    fn timeout_includes_descendant_output_drain() {
+        let config = Config::parse(include_str!("../config.example.toml")).unwrap();
+        let start = Instant::now();
+        let result = probe(
+            &config.backends[0],
+            &["sh".into(), "-c".into(), "sleep 8 & printf '25 25'".into()],
+            1,
+            Path::new("."),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }
