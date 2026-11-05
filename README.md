@@ -51,6 +51,11 @@ expanded. Keep personal state and logs outside the repository.
   `claude_text` (five-hour/seven-day used percentages, with `None` for missing),
   `claude_json` (usage endpoint JSON), `eon_codex` / `eon_claude` (workspace JSON),
   or `remaining_json` (object mapping window names to remaining percentages).
+  `agy` reads the rows of one model group: `agy_group` names it and defaults to
+  `Claude and GPT models`. The group needs a weekly row; its five-hour row is
+  optional. A limit that names `five_hour` still refuses a group without that
+  row unless `allow_missing` is set. A `disabled` value reads as 0% remaining,
+  and each row's RFC 3339 reset time is kept when present.
   Reader commands have a configurable timeout covering output collection, and a
   1 MiB output limit. Optional `refresh` runs only after a failed real-launch probe,
   below the backend's cap, then retries once.
@@ -59,7 +64,10 @@ expanded. Keep personal state and logs outside the repository.
   `allow_missing` permits absent windows in an otherwise valid reading. `"*"`
   checks every returned window. Eon window keys are `DURATIONm/INDEX` to preserve
   scoped windows with the same duration. Eon snapshots must report `state = "fresh"`;
-  missing, stale, error and unknown snapshots refuse.
+  missing, stale, error and unknown snapshots refuse. A refused role lists every
+  window under its limit as `NAME_left=N%`, adding `(resets TIME)` when the reader
+  reports a reset time, for example
+  `quota limit: weekly_left=0% (resets 2030-01-08T14:00:00Z)`.
 - A backend without a quota reader requires explicit `allow_unknown_quota = true`.
   An unsuccessful configured reader always refuses. The example disables OpenCode
   until a model and guard are chosen.

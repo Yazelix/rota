@@ -59,6 +59,7 @@ pub struct Backend {
 pub struct Reader {
     pub command: Vec<String>,
     pub parser: Parser,
+    pub agy_group: Option<String>,
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
     pub refresh: Option<Vec<String>>,
@@ -172,6 +173,18 @@ impl Config {
             {
                 return fail("invalid check, preparation or reader command/timeout");
             }
+            if b.quota.as_ref().is_some_and(|q| {
+                q.agy_group.as_ref().is_some_and(|g| {
+                    !matches!(q.parser, Parser::Agy)
+                        || g.is_empty()
+                        || g.trim() != g
+                        || g.contains(['\t', '\n', '\r'])
+                })
+            }) {
+                return fail(
+                    "agy_group needs parser = \"agy\" and a non-empty single-line name without surrounding spaces",
+                );
+            }
             if b.cap.as_ref().is_some_and(|c| {
                 c.max == 0
                     || c.executable.is_empty()
@@ -245,10 +258,41 @@ mod tests {
             ("fallback = \"main\"", "fallback = \"absent\""),
             ("roles = []", "roles = [\"implement\"]"),
             ("{prompt}", "missing-prompt"),
+            ("parser = \"agy\"", "parser = \"agy\"\nagy_group = \"\""),
+            (
+                "parser = \"agy\"",
+                "parser = \"agy\"\nagy_group = \" Gemini Models\"",
+            ),
+            (
+                "parser = \"agy\"",
+                "parser = \"agy\"\nagy_group = \"Gemini\\nModels\"",
+            ),
+            (
+                "parser = \"claude_text\"",
+                "parser = \"claude_text\"\nagy_group = \"Gemini Models\"",
+            ),
         ] {
             assert_ne!(EXAMPLE, EXAMPLE.replace(from, to));
             assert!(Config::parse(&EXAMPLE.replace(from, to)).is_err(), "{from}");
         }
         assert!(Config::parse(&format!("typo = true\n{EXAMPLE}")).is_err());
+    }
+
+    #[test]
+    fn accepts_agy_group_on_agy_parser() {
+        let config = Config::parse(&EXAMPLE.replace(
+            "parser = \"agy\"",
+            "parser = \"agy\"\nagy_group = \"Gemini Models\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            config.backends[0]
+                .quota
+                .as_ref()
+                .unwrap()
+                .agy_group
+                .as_deref(),
+            Some("Gemini Models")
+        );
     }
 }

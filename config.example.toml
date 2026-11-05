@@ -16,6 +16,8 @@ high = ["agy", "-i", "{prompt}", "--model", "MODEL-HIGH", "--dangerously-skip-pe
 [backends.quota]
 command = ["agy", "-p", "/usage"]
 parser = "agy"
+# Row group read from /usage (default below); a Gemini backend sets e.g. "Gemini Models".
+# agy_group = "Claude and GPT models"
 timeout_seconds = 60
 [backends.cap]
 max = 1

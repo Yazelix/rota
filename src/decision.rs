@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Default, Serialize)]
 pub struct Reading {
     pub remaining: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub resets: BTreeMap<String, String>,
     pub running: usize,
     pub problem: Option<String>,
     pub detail: String,
@@ -38,7 +40,7 @@ pub fn availability(backend: &Backend, reading: &Reading, role: Role) -> Result<
         return Err("quota empty (not explicitly allowed)".into());
     }
     if let Some(limits) = backend.limits.get(&role) {
-        check_limits(remaining, limits)?;
+        check_limits(remaining, &reading.resets, limits)?;
     }
     Ok(())
 }
@@ -52,31 +54,55 @@ fn percent_cmp(value: f64, threshold: f64) -> std::cmp::Ordering {
     }
 }
 
-fn check_limits(remaining: &BTreeMap<String, f64>, limits: &Limits) -> Result<(), String> {
+fn check_limits(
+    remaining: &BTreeMap<String, f64>,
+    resets: &BTreeMap<String, String>,
+    limits: &Limits,
+) -> Result<(), String> {
+    let mut failed = BTreeMap::new();
+    let mut missing: Vec<&str> = Vec::new();
     for (used, rules) in [(false, &limits.min_remaining), (true, &limits.max_used)] {
         for (window, threshold) in rules {
             let values: Vec<_> = if window == "*" {
-                remaining.values().copied().collect()
+                remaining.iter().collect()
             } else {
-                remaining.get(window).copied().into_iter().collect()
+                remaining.get_key_value(window).into_iter().collect()
             };
             if values.is_empty() && !limits.allow_missing {
-                return Err(format!("missing quota window {window}"));
+                missing.push(window.as_str());
             }
-            if values.iter().any(|v| {
-                if used {
-                    percent_cmp(*v, 100.0 - threshold) != std::cmp::Ordering::Greater
+            for (key, value) in values {
+                let under = if used {
+                    percent_cmp(*value, 100.0 - threshold) != std::cmp::Ordering::Greater
                 } else if limits.strictly_above_min {
-                    percent_cmp(*v, *threshold) != std::cmp::Ordering::Greater
+                    percent_cmp(*value, *threshold) != std::cmp::Ordering::Greater
                 } else {
-                    percent_cmp(*v, *threshold) == std::cmp::Ordering::Less
+                    percent_cmp(*value, *threshold) == std::cmp::Ordering::Less
+                };
+                if under {
+                    failed.insert(key, *value);
                 }
-            }) {
-                return Err(format!("quota limit for {window}"));
             }
         }
     }
-    Ok(())
+    if failed.is_empty() {
+        return match missing.first() {
+            Some(window) => Err(format!("missing quota window {window}")),
+            None => Ok(()),
+        };
+    }
+    let parts: Vec<_> = failed
+        .iter()
+        .map(|(key, value)| match resets.get(*key) {
+            Some(reset) => format!("{key}_left={value}% (resets {reset})"),
+            None => format!("{key}_left={value}%"),
+        })
+        .collect();
+    let mut text = format!("quota limit: {}", parts.join(", "));
+    if !missing.is_empty() {
+        text.push_str(&format!("; missing quota window {}", missing.join(", ")));
+    }
+    Err(text)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -314,8 +340,13 @@ mod tests {
             );
             for used in [threshold - 0.001, threshold, threshold + 0.001] {
                 reading.remaining = Some(
-                    crate::quota::parse(crate::config::Parser::ClaudeText, &format!("{used} None"))
-                        .unwrap(),
+                    crate::quota::parse(
+                        crate::config::Parser::ClaudeText,
+                        None,
+                        &format!("{used} None"),
+                    )
+                    .unwrap()
+                    .remaining,
                 );
                 assert_eq!(
                     availability(backend, &reading, Role::Implement).is_ok(),
@@ -323,5 +354,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn limit_refusal_lists_failing_windows_with_resets() {
+        let remaining: BTreeMap<String, f64> = BTreeMap::from([
+            ("five_hour".into(), 0.0),
+            ("other".into(), 50.0),
+            ("weekly".into(), 0.0),
+        ]);
+        let resets: BTreeMap<String, String> =
+            BTreeMap::from([("weekly".into(), "2030-01-08T14:00:00Z".into())]);
+        let limits = Limits {
+            min_remaining: [("*".into(), 10.0), ("weekly".into(), 10.0)].into(),
+            ..Limits::default()
+        };
+        assert_eq!(
+            check_limits(&remaining, &resets, &limits).unwrap_err(),
+            "quota limit: five_hour_left=0%, weekly_left=0% (resets 2030-01-08T14:00:00Z)"
+        );
+        let missing = Limits {
+            min_remaining: [("absent".into(), 1.0)].into(),
+            ..Limits::default()
+        };
+        assert_eq!(
+            check_limits(&remaining, &resets, &missing).unwrap_err(),
+            "missing quota window absent"
+        );
+    }
+
+    #[test]
+    fn missing_window_does_not_hide_exhausted_window() {
+        let remaining: BTreeMap<String, f64> = BTreeMap::from([("weekly".into(), 0.0)]);
+        let resets: BTreeMap<String, String> =
+            BTreeMap::from([("weekly".into(), "2030-01-08T14:00:00Z".into())]);
+        let limits = Limits {
+            min_remaining: [("five_hour".into(), 10.0), ("weekly".into(), 10.0)].into(),
+            allow_missing: false,
+            ..Limits::default()
+        };
+        assert_eq!(
+            check_limits(&remaining, &resets, &limits),
+            Err("quota limit: weekly_left=0% (resets 2030-01-08T14:00:00Z); missing quota window five_hour".into())
+        );
+    }
+
+    #[test]
+    fn reading_serializes_resets_only_when_present() {
+        let mut reading = Reading::default();
+        assert!(
+            serde_json::to_value(&reading)
+                .unwrap()
+                .get("resets")
+                .is_none()
+        );
+        reading
+            .resets
+            .insert("weekly".into(), "2030-01-08T14:00:00Z".into());
+        assert_eq!(
+            serde_json::to_value(&reading)
+                .unwrap()
+                .get("resets")
+                .unwrap()["weekly"],
+            "2030-01-08T14:00:00Z"
+        );
     }
 }

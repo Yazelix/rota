@@ -215,7 +215,7 @@ pub fn read(backend: &Backend, cwd: &Path, allow_refresh: bool) -> Reading {
         if let Some(reader) = &backend.quota {
             let get = || {
                 probe(backend, &reader.command, reader.timeout_seconds, cwd)
-                    .and_then(|s| quota::parse(reader.parser, &s))
+                    .and_then(|s| quota::parse(reader.parser, reader.agy_group.as_deref(), &s))
             };
             let mut quota = get();
             if quota.is_err() && allow_refresh {
@@ -225,15 +225,15 @@ pub fn read(backend: &Backend, cwd: &Path, allow_refresh: bool) -> Reading {
                     quota = get();
                 }
             }
-            reading.remaining = Some(quota.map_err(|e| format!("quota unreadable: {e}"))?);
-            reading.detail = reading
+            let quota = quota.map_err(|e| format!("quota unreadable: {e}"))?;
+            reading.detail = quota
                 .remaining
-                .as_ref()
-                .unwrap()
                 .iter()
                 .map(|(k, v)| format!("{k}_left={v}%"))
                 .collect::<Vec<_>>()
                 .join(" ");
+            reading.resets = quota.resets;
+            reading.remaining = Some(quota.remaining);
         } else {
             reading.detail = "quota unknown".into();
         }
