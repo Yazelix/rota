@@ -16,6 +16,7 @@ paths, commands, models and example percentages.
 ```text
 rota launch [--role implement|review] [--level medium|high] [--only BACKEND] [--dry-run] <prompt-file>
 rota run --brief FILE --name NAME --timeout DURATION [--role implement|review] [--only BACKEND] [--cwd DIR] [--effort LEVEL] [--add-dir DIR]...
+rota ps [--json] [--all]
 rota status [--json]
 ```
 
@@ -84,6 +85,19 @@ Writers hold `sessions/.lock` and merge their fields into the record as it is
 on disk, so fields another command adds during a run are kept. A record that
 exists but cannot be read or parsed is never replaced. `rota run` takes the lock
 before the run starts; the final write waits for it at most 10 seconds.
+
+`rota ps` lists the registry's sessions that have not finished, oldest
+first; `--all` adds finished ones. Each has a state: `running` while its
+process is alive, `dead` when the process is gone but the record never got
+`finished` (rota itself was stopped), or `finished`. A process is alive while
+`/proc/PID` exists and, for a record that names a `unit`, the process is in
+that unit, so a reused PID never passes for the session. The text form prints
+one line per session: ID, state, backend, role, PID, age, folder, log, and the
+pane, outcome and exit code when the record has them. `--json` prints the
+records as stored, each with `state`, `alive` and `age_seconds` (seconds since
+`started`) added. ps reads the registry without its lock and writes nothing.
+A record it cannot read or parse is reported on stderr, the others are still
+printed, and rota exits 1.
 
 ## Configuration
 

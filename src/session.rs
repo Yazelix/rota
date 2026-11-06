@@ -2,6 +2,7 @@
 //! `<state dir>/sessions/<id>.json`, where the state dir holds `state_file`.
 use crate::config::Role;
 use crate::launch::{atomic_write, ensure_parent};
+use crate::run::cgroup_of;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -154,6 +155,58 @@ pub fn update(
     store(&path, &serde_json::Value::Object(json))
 }
 
+/// Every readable record under `sessions/`, oldest first (by `started`, then `id`),
+/// and one problem line per `*.json` record that cannot be read or parsed.
+/// Reads without the registry lock and creates nothing; a missing registry is empty.
+pub fn list(state_file: &Path) -> std::io::Result<(Vec<Session>, Vec<String>)> {
+    let dir = state_dir(state_file).join("sessions");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], vec![])),
+        Err(e) => return Err(e),
+    };
+    let mut sessions = Vec::new();
+    let mut problems = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                problems.push(format!("cannot read {}: {e}", path.display()));
+                continue;
+            }
+        };
+        match serde_json::from_slice::<Session>(&bytes) {
+            Ok(session) => sessions.push(session),
+            Err(e) => problems.push(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+    sessions.sort_by(|a, b| a.started.cmp(&b.started).then_with(|| a.id.cmp(&b.id)));
+    problems.sort();
+    Ok((sessions, problems))
+}
+
+/// Whether the session's process is alive: `PID` is in `proc_dir` and, when the record
+/// names a `unit`, the process is in that unit's cgroup, so a reused PID never counts.
+pub fn alive(proc_dir: &Path, session: &Session) -> bool {
+    let Ok(pid) = i32::try_from(session.pid) else {
+        return false;
+    };
+    if let Some(unit) = &session.unit {
+        return cgroup_of(proc_dir, pid).is_some_and(|path| path.ends_with(&format!("/{unit}")));
+    }
+    proc_dir.join(pid.to_string()).exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +303,38 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("state/sessions")).unwrap();
         std::fs::write(record_path(&state, "t-3"), "{}").unwrap();
         assert_eq!(claim(&state, "t").unwrap().0, "t-4");
+    }
+    #[test]
+    fn alive_needs_the_pid_and_its_unit() {
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let proc = dir.path();
+        fs::create_dir(proc.join("42")).unwrap();
+        fs::write(
+            proc.join("42/cgroup"),
+            "0::/user.slice/app.slice/rota-t-1-ab.scope\n",
+        )
+        .unwrap();
+        let text = r#"{"schema":1,"id":"t-1","name":"t","kind":"run","backend":"b",
+            "role":"review","cwd":"/fictional","brief":"/fictional/brief","pid":2,
+            "rota_pid":1,"started":5}"#;
+        let mut session: Session = serde_json::from_str(text).unwrap();
+        session.pid = 42;
+        session.unit = Some("rota-t-1-ab.scope".into());
+        assert!(alive(proc, &session));
+        session.unit = Some("rota-t-2-cd.scope".into());
+        assert!(!alive(proc, &session));
+        session.unit = Some("t-1-ab.scope".into());
+        assert!(!alive(proc, &session));
+        session.unit = None;
+        assert!(alive(proc, &session));
+        session.pid = 43;
+        session.unit = None;
+        assert!(!alive(proc, &session));
+        session.pid = 43;
+        session.unit = Some("rota-t-1-ab.scope".into());
+        assert!(!alive(proc, &session));
+        session.pid = u32::MAX;
+        session.unit = None;
+        assert!(!alive(proc, &session));
     }
 }

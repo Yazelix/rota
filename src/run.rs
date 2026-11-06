@@ -350,7 +350,7 @@ enum Joined {
 
 /// The cgroup-v2 path of `pid` (a removed cgroup shows as `PATH (deleted)`), or `None` when
 /// it cannot be read.
-fn cgroup_of(proc_dir: &Path, pid: i32) -> Option<String> {
+pub(crate) fn cgroup_of(proc_dir: &Path, pid: i32) -> Option<String> {
     let cgroups = fs::read_to_string(proc_dir.join(format!("{pid}/cgroup"))).ok()?;
     let path = cgroups.lines().find_map(|line| line.strip_prefix("0::"))?;
     Some(path.strip_suffix(" (deleted)").unwrap_or(path).to_string())
@@ -540,7 +540,7 @@ fn random() -> Result<String, Failure> {
 const PROBE_SCRIPT: &str = r#"cg=$(sed -n 's/^0:://p' /proc/self/cgroup)
 test -n "$cg" && test -r "/sys/fs/cgroup$cg/cgroup.events" && test -w "/sys/fs/cgroup$cg/cgroup.kill""#;
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
