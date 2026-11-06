@@ -4,6 +4,7 @@ use crate::quota;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -141,10 +142,22 @@ fn split_null(bytes: &[u8]) -> Vec<String> {
 }
 
 pub fn running(cap: &Cap) -> Result<usize, String> {
+    running_in(Path::new("/proc"), unsafe { libc::geteuid() }, cap)
+}
+
+fn owned_by(dir: &Path, uid: u32) -> bool {
+    fs::metadata(dir).is_ok_and(|meta| meta.uid() == uid)
+}
+
+/// The cap is per user: only `uid`'s processes count. A process that exits or
+/// changes owner mid-scan is skipped. A live process of `uid` that matches by
+/// command line but cannot be inspected fails the scan, as does an unlistable
+/// `proc`.
+fn running_in(proc: &Path, uid: u32, cap: &Cap) -> Result<usize, String> {
     let mut count = 0;
     let resolved = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .find_map(|dir| fs::canonicalize(dir.join(&cap.executable)).ok());
-    for entry in fs::read_dir("/proc").map_err(|_| "cannot scan /proc for concurrency cap")? {
+    for entry in fs::read_dir(proc).map_err(|_| "cannot scan /proc for concurrency cap")? {
         let entry = entry.map_err(|_| "cannot read process entry")?;
         if !entry
             .file_name()
@@ -152,6 +165,9 @@ pub fn running(cap: &Cap) -> Result<usize, String> {
             .chars()
             .all(|c| c.is_ascii_digit())
         {
+            continue;
+        }
+        if !owned_by(&entry.path(), uid) {
             continue;
         }
         let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
@@ -162,6 +178,9 @@ pub fn running(cap: &Cap) -> Result<usize, String> {
         if !executable_matches(cap, &argv, actual.as_deref(), resolved.as_deref()) {
             continue;
         }
+        let gone = |e: &std::io::Error| {
+            e.kind() == std::io::ErrorKind::NotFound || !owned_by(&entry.path(), uid)
+        };
         let env = if cap.env.is_empty() {
             BTreeMap::new()
         } else {
@@ -170,14 +189,14 @@ pub fn running(cap: &Cap) -> Result<usize, String> {
                     .into_iter()
                     .filter_map(|s| s.split_once('=').map(|(k, v)| (k.into(), v.into())))
                     .collect(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if gone(&e) => continue,
                 Err(_) => return Err("cannot inspect matching process environment".into()),
             }
         };
         let cwd = if cap.script.is_some() || !cap.env.is_empty() {
             match fs::read_link(entry.path().join("cwd")) {
                 Ok(cwd) => cwd,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if gone(&e) => continue,
                 Err(_) => return Err("cannot inspect matching process working directory".into()),
             }
         } else {
@@ -351,5 +370,79 @@ mod tests {
         );
         assert!(result.unwrap_err().contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+    fn scan_cap() -> Cap {
+        Cap {
+            max: 1,
+            executable: "fake-agent".into(),
+            runtime_executables: vec![],
+            script: None,
+            env: BTreeMap::from([("AGENT_HOME".into(), "/fictional/account".into())]),
+            exclude_args: vec![],
+        }
+    }
+    fn fake_process(proc: &Path, pid: &str, argv0: &str) -> PathBuf {
+        let dir = proc.join(pid);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("cmdline"), format!("{argv0}\0work\0")).unwrap();
+        fs::write(dir.join("environ"), "AGENT_HOME=/fictional/account\0").unwrap();
+        std::os::unix::fs::symlink(proc, dir.join("cwd")).unwrap();
+        dir
+    }
+    #[test]
+    fn cap_scan_counts_current_users_matching_processes() {
+        let root = tempfile::tempdir_in("target").unwrap();
+        let proc = root.path();
+        let uid = fs::metadata(proc).unwrap().uid();
+        fake_process(proc, "100", "/bin/fake-agent");
+        fake_process(proc, "101", "fake-agent");
+        fake_process(proc, "102", "/bin/other-agent");
+        fs::create_dir(proc.join("self")).unwrap();
+        assert_eq!(running_in(proc, uid, &scan_cap()), Ok(2));
+    }
+    #[test]
+    fn cap_scan_skips_other_users_processes() {
+        let root = tempfile::tempdir_in("target").unwrap();
+        let proc = root.path();
+        let uid = fs::metadata(proc).unwrap().uid();
+        fake_process(proc, "100", "/bin/fake-agent");
+        assert_eq!(running_in(proc, uid.wrapping_add(1), &scan_cap()), Ok(0));
+    }
+    #[test]
+    fn cap_scan_skips_vanished_processes() {
+        let root = tempfile::tempdir_in("target").unwrap();
+        let proc = root.path();
+        let uid = fs::metadata(proc).unwrap().uid();
+        fake_process(proc, "100", "/bin/fake-agent");
+        std::os::unix::fs::symlink(proc.join("exited"), proc.join("200")).unwrap();
+        let no_cwd = fake_process(proc, "201", "/bin/fake-agent");
+        fs::remove_file(no_cwd.join("cwd")).unwrap();
+        let no_environ = fake_process(proc, "202", "/bin/fake-agent");
+        fs::remove_file(no_environ.join("environ")).unwrap();
+        let unrelated = fake_process(proc, "203", "/bin/other-agent");
+        fs::remove_file(unrelated.join("environ")).unwrap();
+        fs::create_dir(unrelated.join("environ")).unwrap();
+        assert_eq!(running_in(proc, uid, &scan_cap()), Ok(1));
+    }
+    #[test]
+    fn cap_scan_fails_on_a_live_unreadable_matching_process() {
+        let root = tempfile::tempdir_in("target").unwrap();
+        let proc = root.path();
+        let uid = fs::metadata(proc).unwrap().uid();
+        let agent = fake_process(proc, "100", "/bin/fake-agent");
+        fs::remove_file(agent.join("environ")).unwrap();
+        fs::create_dir(agent.join("environ")).unwrap();
+        assert_eq!(
+            running_in(proc, uid, &scan_cap()),
+            Err("cannot inspect matching process environment".into())
+        );
+        fs::remove_dir(agent.join("environ")).unwrap();
+        fs::write(agent.join("environ"), "AGENT_HOME=/fictional/account\0").unwrap();
+        fs::remove_file(agent.join("cwd")).unwrap();
+        fs::write(agent.join("cwd"), "").unwrap();
+        assert_eq!(
+            running_in(proc, uid, &scan_cap()),
+            Err("cannot inspect matching process working directory".into())
+        );
     }
 }

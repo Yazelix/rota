@@ -73,7 +73,10 @@ expanded. Keep personal state and logs outside the repository.
   until a model and guard are chosen.
 - `cap` scans Linux `/proc` for an executable basename and optional environment
   values; account-directory aliases are canonicalized. `exclude_args` omits usage
-  probes. Counts include every matching process, regardless of role. A lock beside
+  probes. Counts include only the matching processes of the user running rota,
+  regardless of role; a process that exits or changes owner mid-scan is
+  skipped, and a live matching process whose environment or working directory
+  cannot be read fails the check. A lock beside
   `state_file` serializes rota launches through exec; independently started CLIs
   are observed by the process scan rather than controlled by this lock. Caps are
   rechecked before refresh and exec, including resolved executable identities.
