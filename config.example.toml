@@ -5,6 +5,13 @@ state_file = "/PATH/TO/state/last-pick"
 log_file = "/PATH/TO/state/decisions.jsonl"
 fallback = "main"
 
+# Headless runs (rota run) only, never checks: drop these inherited variables
+# (a trailing * matches every name with that prefix), then set [run.env].
+[run]
+unset_env = ["DISPLAY", "WAYLAND_DISPLAY", "TERMINAL_*"]
+[run.env]
+TERMINAL_RUNTIME_DIR = "/PATH/TO/private-runtime"
+
 [[backends]]
 name = "alpha"
 roles = ["implement", "review"]
@@ -82,6 +89,17 @@ parser = "eon_codex"
 strictly_above_min = true
 [backends.limits.implement.min_remaining]
 "*" = 0
+# Headless runs. {brief} {cwd} {report} {effort} may sit inside an argument;
+# {add_dirs} is a whole argument that repeats add_dir once per --add-dir.
+# A role listed here can run headless even when `roles` leaves it out.
+[backends.run]
+stdin = "brief"
+efforts = ["medium", "high", "xhigh"]
+default_effort = "high"
+add_dir = ["--add-dir", "{dir}"]
+[backends.run.commands]
+implement = ["codex", "exec", "-m", "MODEL", "-c", "model_reasoning_effort={effort}", "-s", "workspace-write", "{add_dirs}", "-C", "{cwd}", "-o", "{report}", "-"]
+review = ["codex", "exec", "-m", "MODEL", "-c", "model_reasoning_effort={effort}", "-s", "read-only", "-C", "{cwd}", "-o", "{report}", "-"]
 
 [[backends]]
 name = "open"

@@ -7,7 +7,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,11 +22,49 @@ pub fn command(backend: &Backend, argv: &[String]) -> Command {
     cmd
 }
 
+/// How long rota waits for a process it killed to exit before giving up on it, so a process
+/// stuck in uninterruptible I/O cannot hold rota up.
+pub const REAP: Duration = Duration::from_secs(1);
+
+/// Whether `child`, already sent SIGKILL, exits within `limit`.
+pub fn reap_within(child: &mut Child, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// SIGKILLs the process group a check runs in.
+fn kill_group(child: &mut Child) {
+    // The unreaped child's PID identifies only the process group we created.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
 pub fn probe(
     backend: &Backend,
     argv: &[String],
     seconds: u64,
     cwd: &Path,
+) -> Result<String, String> {
+    probe_killing(backend, argv, seconds, cwd, kill_group)
+}
+
+/// `probe`, ending the check with `kill` when it must stop early.
+fn probe_killing(
+    backend: &Backend,
+    argv: &[String],
+    seconds: u64,
+    cwd: &Path,
+    kill: fn(&mut Child),
 ) -> Result<String, String> {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(seconds))
@@ -49,13 +87,12 @@ pub fn probe(
             .map(|_| bytes);
         let _ = sender.send(result);
     });
-    let stop = |child: &mut std::process::Child| {
-        // The unreaped child's PID identifies only the process group we created.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
+    let stop = |child: &mut Child, problem: &str| -> String {
+        kill(child);
+        match reap_within(child, REAP) {
+            true => problem.to_string(),
+            false => format!("{problem}; still running after SIGKILL"),
         }
-        let _ = child.kill();
-        let _ = child.wait();
     };
     let mut bytes = None;
     loop {
@@ -63,8 +100,7 @@ pub fn probe(
             match receiver.try_recv() {
                 Ok(Ok(output)) if output.len() <= 1_048_576 => bytes = Some(output),
                 Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
-                    stop(&mut child);
-                    return Err("check output unreadable or exceeds 1 MiB".into());
+                    return Err(stop(&mut child, "check output unreadable or exceeds 1 MiB"));
                 }
                 Err(mpsc::TryRecvError::Empty) => (),
             }
@@ -79,14 +115,12 @@ pub fn probe(
                 Ok(Some(status)) => return Err(format!("check failed ({status})")),
                 Ok(None) => (),
                 Err(_) => {
-                    stop(&mut child);
-                    return Err("cannot wait for check".into());
+                    return Err(stop(&mut child, "cannot wait for check"));
                 }
             }
         }
         if Instant::now() >= deadline {
-            stop(&mut child);
-            return Err("check timed out".into());
+            return Err(stop(&mut child, "check timed out"));
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -310,6 +344,23 @@ pub fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_check_that_outlives_sigkill_is_given_up_on() {
+        // A kill that does nothing stands in for a check stuck in uninterruptible I/O.
+        let text = "name = 'b'\nroles = []\nguard = ['true']\ncommands = {}";
+        let backend: Backend = toml::from_str(text).unwrap();
+        let argv = ["sleep".to_string(), "5".to_string()];
+        let start = Instant::now();
+        let result = probe_killing(&backend, &argv, 0, Path::new("."), |_| {});
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result.unwrap_err(),
+            "check timed out; still running after SIGKILL"
+        );
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        let result = probe(&backend, &argv, 0, Path::new("."));
+        assert_eq!(result.unwrap_err(), "check timed out");
+    }
     #[test]
     fn process_caps_include_all_roles_and_exclude_usage() {
         let mut cap = Cap {

@@ -139,6 +139,27 @@ pub fn candidates(config: &Config, role: Role, only: Option<&str>) -> Result<Vec
         .collect())
 }
 
+/// The first available backend in `allowed`, in rotation order after `last`.
+pub fn rotate(
+    config: &Config,
+    allowed: &[usize],
+    readings: &[Reading],
+    role: Role,
+    last: Option<&str>,
+) -> Option<usize> {
+    let start = last
+        .and_then(|name| config.backends.iter().position(|b| b.name == name))
+        .map_or(0, |i| i + 1);
+    (0..config.backends.len())
+        .map(|offset| (start + offset) % config.backends.len())
+        .find(|index| {
+            allowed.contains(index)
+                && readings
+                    .get(*index)
+                    .is_some_and(|r| availability(&config.backends[*index], r, role).is_ok())
+        })
+}
+
 pub fn choose(
     config: &Config,
     readings: &[Reading],
@@ -147,21 +168,11 @@ pub fn choose(
     last: Option<&str>,
 ) -> Result<Pick, Refusal> {
     let allowed = candidates(config, role, only)?;
-    let start = last
-        .and_then(|name| config.backends.iter().position(|b| b.name == name))
-        .map_or(0, |i| i + 1);
-    for offset in 0..config.backends.len() {
-        let index = (start + offset) % config.backends.len();
-        if allowed.contains(&index)
-            && readings
-                .get(index)
-                .is_some_and(|r| availability(&config.backends[index], r, role).is_ok())
-        {
-            return Ok(Pick {
-                index,
-                fallback: false,
-            });
-        }
+    if let Some(index) = rotate(config, &allowed, readings, role, last) {
+        return Ok(Pick {
+            index,
+            fallback: false,
+        });
     }
     if role == Role::Implement && only.is_none() {
         if let Some(index) = config
@@ -254,6 +265,18 @@ mod tests {
                 .code,
             2
         );
+    }
+    #[test]
+    fn rotate_uses_the_given_list_not_roles() {
+        let config = config();
+        let mut r = readings(&config);
+        assert_eq!(rotate(&config, &[2], &r, Role::Review, None), Some(2));
+        assert_eq!(
+            rotate(&config, &[0, 2], &r, Role::Review, Some("alpha")),
+            Some(2)
+        );
+        r[2].problem = Some("guard missing".into());
+        assert_eq!(rotate(&config, &[2], &r, Role::Review, None), None);
     }
     #[test]
     fn refuses_or_explicitly_falls_back() {

@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type Failure = (u8, String);
+pub type Failure = (u8, String);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
@@ -69,7 +69,7 @@ pub fn parse(args: &[String]) -> Result<Options, Failure> {
     Ok(options)
 }
 
-fn ensure_parent(path: &Path) -> std::io::Result<&Path> {
+pub fn ensure_parent(path: &Path) -> std::io::Result<&Path> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -155,9 +155,10 @@ pub fn display_command(backend: &Backend, level: Level, cwd: &str, prompt_file: 
     args.join(" ")
 }
 
-fn log(
+pub fn log(
     config: &Config,
-    options: &Options,
+    role: Role,
+    level: Option<Level>,
     cwd: &Path,
     readings: &[decision::Reading],
     pick: Option<&decision::Pick>,
@@ -171,17 +172,66 @@ fn log(
         .map_err(io_failure)?;
     let entry = serde_json::json!({
         "time": SystemTime::now().duration_since(UNIX_EPOCH).map_err(io_failure)?.as_secs(),
-        "folder": cwd, "role": options.role, "level": options.level,
+        "folder": cwd, "role": role, "level": level,
         "pick": pick.map(|p| &config.backends[p.index].name),
         "decision": match pick { Some(p) if p.fallback => "FALLBACK", Some(_) => "pick", None => "REFUSAL" },
-        "readings": config.backends.iter().zip(readings).map(|(b,r)| serde_json::json!({"backend": b.name, "reading": r, "availability": decision::availability(b,r,options.role).err()})).collect::<Vec<_>>()
+        "readings": config.backends.iter().zip(readings).map(|(b,r)| serde_json::json!({"backend": b.name, "reading": r, "availability": decision::availability(b,r,role).err()})).collect::<Vec<_>>()
     });
     writeln!(file, "{entry}").map_err(io_failure)?;
     file.sync_data().map_err(io_failure)
 }
 
-fn io_failure(error: impl std::fmt::Display) -> Failure {
+pub fn io_failure(error: impl std::fmt::Display) -> Failure {
     (1, error.to_string())
+}
+
+/// Serializes rota's backend selection; the descriptor closes on exec.
+pub fn lock(config: &Config, wait: bool) -> Result<File, Failure> {
+    let mut lock_path = config.state_file.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    ensure_parent(&lock_path).map_err(io_failure)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)
+        .map_err(io_failure)?;
+    let locked = if wait {
+        lock.lock_exclusive()
+    } else {
+        lock.try_lock_exclusive()
+    };
+    locked.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            (3, "another rota command is selecting a backend".into())
+        } else {
+            io_failure(e)
+        }
+    })?;
+    Ok(lock)
+}
+
+pub fn print_readings(
+    config: &Config,
+    indices: &[usize],
+    readings: &[decision::Reading],
+    role: Role,
+) {
+    for index in indices {
+        let b = &config.backends[*index];
+        let r = &readings[*index];
+        eprintln!(
+            "rota: {} [{}]: {}",
+            b.name,
+            decision::availability(b, r, role)
+                .err()
+                .unwrap_or_else(|| "available".into()),
+            r.detail
+        );
+    }
 }
 
 pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
@@ -212,30 +262,11 @@ pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
             indices.push(index);
         }
     }
-    // Serialize rota launches from scan through exec; the descriptor closes on exec.
+    // Serialize rota launches from scan through exec.
     let _lock = if options.dry_run {
         None
     } else {
-        let mut lock_path = config.state_file.as_os_str().to_os_string();
-        lock_path.push(".lock");
-        let lock_path = PathBuf::from(lock_path);
-        ensure_parent(&lock_path).map_err(io_failure)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(lock_path)
-            .map_err(io_failure)?;
-        lock.try_lock_exclusive().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                (3, "another rota launch is selecting a backend".into())
-            } else {
-                io_failure(e)
-            }
-        })?;
-        Some(lock)
+        Some(lock(config, false)?)
     };
     let last = match fs::read_to_string(&config.state_file) {
         Ok(last) => Some(last),
@@ -251,20 +282,17 @@ pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
         last.as_deref().map(str::trim),
     );
     if !options.dry_run {
-        log(config, options, &cwd, &readings, result.as_ref().ok())?;
+        let level = Some(options.level);
+        log(
+            config,
+            options.role,
+            level,
+            &cwd,
+            &readings,
+            result.as_ref().ok(),
+        )?;
     }
-    for index in &indices {
-        let b = &config.backends[*index];
-        let r = &readings[*index];
-        eprintln!(
-            "rota: {} [{}]: {}",
-            b.name,
-            decision::availability(b, r, options.role)
-                .err()
-                .unwrap_or_else(|| "available".into()),
-            r.detail
-        );
-    }
+    print_readings(config, &indices, &readings, options.role);
     let pick = result.map_err(|e| (e.code, e.message))?;
     let backend = &config.backends[pick.index];
     if pick.fallback {
@@ -296,7 +324,14 @@ pub fn run(config: &Config, options: &Options) -> Result<(), Failure> {
         })
         .collect();
     if let Err(problem) = readings::recheck_cap(backend, &mut readings[pick.index]) {
-        log(config, options, &cwd, &readings, None)?;
+        log(
+            config,
+            options.role,
+            Some(options.level),
+            &cwd,
+            &readings,
+            None,
+        )?;
         return Err((3, problem));
     }
     atomic_write(&config.state_file, format!("{}\n", backend.name).as_bytes())

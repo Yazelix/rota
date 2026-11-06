@@ -15,6 +15,7 @@ paths, commands, models and example percentages.
 
 ```text
 rota launch [--role implement|review] [--level medium|high] [--only BACKEND] [--dry-run] <prompt-file>
+rota run --brief FILE --name NAME --timeout DURATION [--role implement|review] [--only BACKEND] [--cwd DIR] [--effort LEVEL] [--add-dir DIR]...
 rota status [--json]
 ```
 
@@ -23,12 +24,66 @@ replaces itself with the selected CLI. It checks backend guards, account checks,
 quota limits and running processes before rotating to the next available backend.
 Only implementers without `--only` can use the configured fallback, reported as
 `FALLBACK`. Exit codes: 2 for invalid input/config, 3 for refusal, 1 for I/O or
-launch failure. Status reports availability for both roles.
+launch failure. Status reports availability for both roles; a role a backend
+runs only through `rota run` shows as `available for rota run`.
 
 `--dry-run` prints the pick and shell command, showing the prompt as `$(cat file)`.
 It does not write the state, log, lock or trusted settings, run preparation hooks,
 or refresh an account. Quota and guard commands must themselves be read-only.
 Status also skips refresh and writes no rota files.
+
+`rota run` runs one headless agent session (a plan, review or investigation)
+and waits for it. It checks guards, account checks, quota limits and caps like
+`launch`, with no fallback, then runs the backend's `run` command for the role
+in `--cwd` (default: the current folder). It does not apply `trusted_settings`
+or `--level`. Its stdin is the brief file or
+`/dev/null`, never rota's own. Output goes to a log under a run directory named
+by the session, `NAME-N` with the first free `N`; rota prints the pick, session,
+PID, log and report paths before the run starts. `--timeout` takes seconds or
+`Ns`, `Nm`, `Nh`, at most 30 days, and counts from the moment the run starts.
+
+`rota run` needs Linux 5.14 or newer with cgroup v2 and a systemd user manager,
+systemd 254 or newer (tested on 255; systemd-run gets `--expand-environment=no`,
+so arguments stay literal on 258 and later too). It starts the command with
+`systemd-run --user --scope` in a transient unit `rota-ID-HEX.scope`, where HEX
+is 128 random bits, so the unit's cgroup holds every process the run starts,
+whatever their process group, session, parent or threads. Before it claims a
+session, rota starts a throwaway scope that checks its own `cgroup.events` and
+`cgroup.kill`; if that fails or takes more than 10 seconds, rota exits 1. A run
+always gets rota's own `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, the
+variables that reach the manager, and `[run]` may not unset or set them.
+
+rota acts on the unit only once it has seen the run's main process inside it,
+so a name that was already taken is never signalled. When the run's main
+process exits, at the timeout, or when rota gets SIGINT, SIGTERM or SIGHUP, rota
+sends SIGTERM and SIGCONT to every process in the unit's cgroup, waits up to 5
+seconds for it to empty, then sends SIGKILL (and writes `cgroup.kill`) for up to
+10 seconds. rota signals the processes directly through pidfds, never through
+the systemd manager, so a stalled manager cannot delay cleanup, and it skips any
+listed PID that has since left the unit. The run ends only when
+`cgroup.events` confirms the cgroup is empty. If rota cannot confirm that by
+then (processes stuck in uninterruptible I/O, or a cgroup or process membership
+it cannot read) the run is abandoned: rota prints the PIDs it can see, records
+them, and exits 125, never 0. If systemd-run fails before the command starts
+(rota read the main process's cgroup and it is not the unit's), the outcome is
+`failed` and rota exits 1; the log says why.
+rota exits with the run's status: 128+N when a signal N ended it, 124 after a
+timeout, 130 after an interruption and 125 when it abandoned processes. If the
+final record write fails, rota exits 1. A refusal exits 3 and an unusable
+option, backend or brief exits 2, as for `launch`, before anything starts. A run's own status can also be 1, 2 or 3: a run started
+when the `session:` line was printed, and its record's `outcome` says how it
+ended.
+
+Each run is recorded in the session registry: `sessions/ID.json` beside
+`state_file`, naming the run's `unit`, rewritten when the run ends with `finished` (Unix seconds),
+`outcome` (`exited`, `signaled`, `timeout`, `interrupted`, `failed` or `abandoned`) and
+`exit_code`; an abandoned run also lists `abandoned_pids`.
+Run directories are `runs/ID/` beside `state_file`, holding `log` and the
+`report.md` path given to the command. Readers ignore fields they do not know.
+Writers hold `sessions/.lock` and merge their fields into the record as it is
+on disk, so fields another command adds during a run are kept. A record that
+exists but cannot be read or parsed is never replaced. `rota run` takes the lock
+before the run starts; the final write waits for it at most 10 seconds.
 
 ## Configuration
 
@@ -88,6 +143,18 @@ expanded. Keep personal state and logs outside the repository.
   refusal are explicit log decisions. `trusted_settings` atomically appends the
   folder to `trustedWorkspaces`, preserving other JSON keys and the file mode.
   `prepare` is an optional list of checked commands run just before exec.
+- `[backends.run]` makes a backend usable by `rota run`. `commands.implement`
+  and `commands.review` are argv arrays; a role with a command can run headless
+  even when `roles` leaves it out, and its quota limits apply. `{brief}`,
+  `{cwd}`, `{report}` and `{effort}` are replaced inside any argument;
+  `{add_dirs}` is a whole argument, never the first, that repeats `add_dir` (an
+  argv fragment with one `{dir}` argument) once per `--add-dir`. `stdin` is `"brief"` or `"null"`;
+  with `"null"` every command must name `{brief}`. `--effort` must be one of
+  `efforts` and defaults to `default_effort`.
+- `[run]` changes the environment of headless runs only, never of checks.
+  `unset_env` removes inherited variables, where a trailing `*` matches a name
+  prefix, then `[run.env]` sets variables, then the backend's `unset_env` and
+  `env` apply. Use it to keep a run away from a desktop or terminal session.
 
 Configuration and reader fixtures are tested with `cargo test`. Before committing,
 run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`.

@@ -1,8 +1,9 @@
 use rota::config::{Config, Role};
-use rota::{decision, launch, readings};
+use rota::{decision, launch, readings, run as headless};
+use std::io::Write;
 use std::{env, fs, process::ExitCode};
 
-const USAGE: &str = "Usage: rota launch [--role implement|review] [--level medium|high] [--only BACKEND] [--dry-run] <prompt-file>\n       rota status [--json]\nConfig: $ROTA_CONFIG or $XDG_CONFIG_HOME/rota/config.toml (default ~/.config/rota/config.toml)";
+const USAGE: &str = "Usage: rota launch [--role implement|review] [--level medium|high] [--only BACKEND] [--dry-run] <prompt-file>\n       rota run --brief FILE --name NAME --timeout DURATION [--role implement|review] [--only BACKEND] [--cwd DIR] [--effort LEVEL] [--add-dir DIR]...\n       rota status [--json]\nConfig: $ROTA_CONFIG or $XDG_CONFIG_HOME/rota/config.toml (default ~/.config/rota/config.toml)";
 
 fn load_config() -> Result<Config, String> {
     let path = env::var_os("ROTA_CONFIG")
@@ -35,6 +36,11 @@ fn run() -> Result<(), (u8, String)> {
         let options = launch::parse(&args[1..])?;
         let config = load_config().map_err(|e| (2, e))?;
         return launch::run(&config, &options);
+    }
+    if args.first().is_some_and(|s| s == "run") {
+        let options = headless::parse(&args[1..])?;
+        let config = load_config().map_err(|e| (2, e))?;
+        return headless::run(&config, &options);
     }
     if args != ["status"] && args != ["status", "--json"] {
         return Err((2, USAGE.into()));
@@ -76,6 +82,15 @@ fn status_for(
         };
     }
     if !b.roles.contains(&role) {
+        if b.run
+            .as_ref()
+            .is_some_and(|run| run.commands.contains_key(&role))
+        {
+            return match decision::availability(b, r, role) {
+                Ok(()) => "available for rota run".into(),
+                Err(problem) => format!("unavailable for rota run: {problem}"),
+            };
+        }
         return "not allowed for role".into();
     }
     decision::availability(b, r, role)
@@ -86,7 +101,8 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err((code, message)) => {
-            eprintln!("rota: {message}");
+            // A run may end after its caller closed stderr; never panic here.
+            let _ = writeln!(std::io::stderr(), "rota: {message}");
             ExitCode::from(code)
         }
     }
